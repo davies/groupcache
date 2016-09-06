@@ -38,8 +38,8 @@ type Sink interface {
 	// The caller retains ownership of m.
 	SetProto(m proto.Message) error
 
-	// view returns a frozen view of the bytes for caching.
-	view() (ByteView, error)
+	// View returns a frozen view of the bytes for caching.
+	View() (ByteView, error)
 }
 
 func cloneBytes(b []byte) []byte {
@@ -76,7 +76,7 @@ type stringSink struct {
 	// TODO(bradfitz): track whether any Sets were called.
 }
 
-func (s *stringSink) view() (ByteView, error) {
+func (s *stringSink) View() (ByteView, error) {
 	// TODO(bradfitz): return an error if no Set was called
 	return s.v, nil
 }
@@ -128,7 +128,7 @@ func (s *byteViewSink) setView(v ByteView) error {
 	return nil
 }
 
-func (s *byteViewSink) view() (ByteView, error) {
+func (s *byteViewSink) View() (ByteView, error) {
 	return *s.dst, nil
 }
 
@@ -165,7 +165,7 @@ type protoSink struct {
 	v ByteView // encoded
 }
 
-func (s *protoSink) view() (ByteView, error) {
+func (s *protoSink) View() (ByteView, error) {
 	return s.v, nil
 }
 
@@ -220,7 +220,7 @@ type allocBytesSink struct {
 	v   ByteView
 }
 
-func (s *allocBytesSink) view() (ByteView, error) {
+func (s *allocBytesSink) View() (ByteView, error) {
 	return s.v, nil
 }
 
@@ -279,7 +279,7 @@ type truncBytesSink struct {
 	v   ByteView
 }
 
-func (s *truncBytesSink) view() (ByteView, error) {
+func (s *truncBytesSink) View() (ByteView, error) {
 	return s.v, nil
 }
 

@@ -295,7 +295,7 @@ func (g *Group) getLocally(ctx Context, key string, dest Sink) (ByteView, error)
 	if err != nil {
 		return ByteView{}, err
 	}
-	return dest.view()
+	return dest.View()
 }
 
 func (g *Group) getFromPeer(ctx Context, peer ProtoGetter, key string) (ByteView, error) {

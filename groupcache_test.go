@@ -348,7 +348,7 @@ func TestAllocatingByteSliceTarget(t *testing.T) {
 	if want := "some bytes"; string(dst) != want {
 		t.Errorf("SetBytes resulted in %q; want %q", dst, want)
 	}
-	v, err := sink.view()
+	v, err := sink.View()
 	if err != nil {
 		t.Fatalf("view after SetBytes failed: %v", err)
 	}

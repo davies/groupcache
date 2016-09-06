@@ -35,6 +35,11 @@ type ByteView struct {
 	s string
 }
 
+// NewByteView creates a ByteView from bytes or string.
+func NewByteView(b []byte, s string) ByteView {
+	return ByteView{b, s}
+}
+
 // Len returns the view's length.
 func (v ByteView) Len() int {
 	if v.b != nil {
