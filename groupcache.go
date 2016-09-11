@@ -202,6 +202,12 @@ func (g *Group) initPeers() {
 	}
 }
 
+// OnEvicted register a callback that will be called when an entry is evicted.
+func (g *Group) OnEvicted(f func(key string, value ByteView)) {
+	g.mainCache.onEvited = f
+	g.hotCache.onEvited = f
+}
+
 func (g *Group) Get(ctx Context, key string, dest Sink) error {
 	g.peersOnce.Do(g.initPeers)
 	g.Stats.Gets.Add(1)
@@ -390,6 +396,7 @@ type cache struct {
 	lru        *lru.Cache
 	nhit, nget int64
 	nevict     int64 // number of evictions
+	onEvited   func(key string, value ByteView)
 }
 
 func (c *cache) stats() CacheStats {
@@ -413,6 +420,9 @@ func (c *cache) add(key string, value ByteView) {
 				val := value.(ByteView)
 				c.nbytes -= int64(len(key.(string))) + int64(val.Len())
 				c.nevict++
+				if c.onEvited != nil {
+					c.onEvited(key.(string), val)
+				}
 			},
 		}
 	}
