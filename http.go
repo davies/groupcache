@@ -225,3 +225,7 @@ func (h *httpGetter) Get(context Context, in *pb.GetRequest, out *pb.GetResponse
 	}
 	return nil
 }
+
+func (h *httpGetter) Fill(context Context, in *pb.GetRequest) error {
+	return nil
+}

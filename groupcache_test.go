@@ -238,6 +238,10 @@ func (p *fakePeer) Get(_ Context, in *pb.GetRequest, out *pb.GetResponse) error 
 	return nil
 }
 
+func (p *fakePeer) Fill(_ Context, in *pb.GetRequest) error {
+	return nil
+}
+
 type fakePeers []ProtoGetter
 
 func (p fakePeers) PickPeer(key string) (peer ProtoGetter, ok bool) {
@@ -371,6 +375,10 @@ type orderedFlightGroup struct {
 	stage1 chan bool
 	stage2 chan bool
 	orig   flightGroup
+}
+
+func (g *orderedFlightGroup) IsDoing(key string) bool {
+	return false
 }
 
 func (g *orderedFlightGroup) Do(key string, fn func() (interface{}, error)) (interface{}, error) {

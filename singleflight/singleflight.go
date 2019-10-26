@@ -34,6 +34,16 @@ type Group struct {
 	m  map[string]*call // lazily initialized
 }
 
+func (g *Group) IsDoing(key string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.m == nil {
+		g.m = make(map[string]*call)
+	}
+	_, ok := g.m[key]
+	return ok
+}
+
 // Do executes and returns the results of the given function, making
 // sure that only one execution is in-flight for a given key at a
 // time. If a duplicate comes in, the duplicate caller waits for the

@@ -320,3 +320,27 @@ func (s *truncBytesSink) SetString(v string) error {
 	s.v.s = v
 	return nil
 }
+
+// BlockSink is a Sink that accept bytes from ByteView without copying.
+type BlockSink struct {
+	bytes []byte
+}
+
+func (s *BlockSink) SetString(v string) error {
+	s.bytes = []byte(v)
+	return nil
+}
+
+func (s *BlockSink) SetBytes(v []byte) error {
+	s.bytes = v
+	return nil
+}
+
+func (s *BlockSink) SetProto(m proto.Message) error {
+	panic("BlockSink doest not accept Proto")
+	return nil
+}
+
+func (s *BlockSink) View() (ByteView, error) {
+	return NewByteView(s.bytes, ""), nil
+}

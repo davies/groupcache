@@ -31,9 +31,9 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/davies/groupcache/singleflight"
 	pb "github.com/golang/groupcache/groupcachepb"
 	"github.com/golang/groupcache/lru"
-	"github.com/golang/groupcache/singleflight"
 )
 
 // A Getter loads data for a key.
@@ -174,6 +174,7 @@ type Group struct {
 // satisfies.  We define this so that we may test with an alternate
 // implementation.
 type flightGroup interface {
+	IsDoing(key string) bool
 	// Done is called when Do is done.
 	Do(key string, fn func() (interface{}, error)) (interface{}, error)
 }
@@ -206,6 +207,28 @@ func (g *Group) initPeers() {
 func (g *Group) OnEvicted(f func(key string, value ByteView)) {
 	g.mainCache.onEvited = f
 	g.hotCache.onEvited = f
+}
+
+func (g *Group) Fill(ctx Context, key string) {
+	g.peersOnce.Do(g.initPeers)
+	if g.IsCached(key) {
+		return
+	}
+	if peer, ok := g.peers.PickPeer(key); ok {
+		req := &pb.GetRequest{
+			Group: &g.name,
+			Key:   &key,
+		}
+		peer.Fill(ctx, req)
+	} else {
+		var dest BlockSink
+		value, err := g.getLocally(ctx, key, &dest)
+		if err != nil {
+			g.Stats.LocalLoadErrs.Add(1)
+		}
+		g.Stats.LocalLoads.Add(1)
+		g.populateCache(key, value, &g.mainCache)
+	}
 }
 
 func (g *Group) Get(ctx Context, key string, dest Sink) error {
@@ -322,6 +345,20 @@ func (g *Group) getFromPeer(ctx Context, peer ProtoGetter, key string) (ByteView
 		g.populateCache(key, value, &g.hotCache)
 	}
 	return value, nil
+}
+
+func (g *Group) IsCached(key string) (ok bool) {
+	if g.cacheBytes <= 0 {
+		return false
+	}
+	_, ok = g.mainCache.get(key)
+	if !ok {
+		_, ok = g.hotCache.get(key)
+	}
+	if !ok {
+		ok = g.loadGroup.IsDoing(key)
+	}
+	return
 }
 
 func (g *Group) lookupCache(key string) (value ByteView, ok bool) {
