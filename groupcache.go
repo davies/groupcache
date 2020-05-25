@@ -209,26 +209,29 @@ func (g *Group) OnEvicted(f func(key string, value ByteView)) {
 	g.hotCache.onEvited = f
 }
 
-func (g *Group) Fill(ctx Context, key string) {
+func (g *Group) Fill(ctx Context, key string) error {
 	g.peersOnce.Do(g.initPeers)
 	if g.IsCached(key) {
-		return
+		return nil
 	}
 	if peer, ok := g.peers.PickPeer(key); ok {
 		req := &pb.GetRequest{
 			Group: &g.name,
 			Key:   &key,
 		}
-		peer.Fill(ctx, req)
-	} else {
-		var dest BlockSink
-		value, err := g.getLocally(ctx, key, &dest)
-		if err != nil {
-			g.Stats.LocalLoadErrs.Add(1)
+		err := peer.Fill(ctx, req)
+		if err == nil {
+			return nil
 		}
-		g.Stats.LocalLoads.Add(1)
-		g.populateCache(key, value, &g.mainCache)
 	}
+	var dest BlockSink
+	value, err := g.GetLocally(ctx, key, &dest)
+	if err != nil {
+		g.Stats.LocalLoadErrs.Add(1)
+	}
+	g.Stats.LocalLoads.Add(1)
+	g.populateCache(key, value, &g.mainCache)
+	return err
 }
 
 func (g *Group) Get(ctx Context, key string, dest Sink) error {
@@ -303,7 +306,7 @@ func (g *Group) load(ctx Context, key string, dest Sink) (value ByteView, destPo
 			// probably boring (normal task movement), so not
 			// worth logging I imagine.
 		}
-		value, err = g.getLocally(ctx, key, dest)
+		value, err = g.GetLocally(ctx, key, dest)
 		if err != nil {
 			g.Stats.LocalLoadErrs.Add(1)
 			return nil, err
@@ -319,7 +322,7 @@ func (g *Group) load(ctx Context, key string, dest Sink) (value ByteView, destPo
 	return
 }
 
-func (g *Group) getLocally(ctx Context, key string, dest Sink) (ByteView, error) {
+func (g *Group) GetLocally(ctx Context, key string, dest Sink) (ByteView, error) {
 	err := g.getter.Get(ctx, key, dest)
 	if err != nil {
 		return ByteView{}, err
