@@ -61,6 +61,16 @@ func (m *Map) Add(keys ...string) {
 	sort.Ints(m.keys)
 }
 
+// Adds a key with different weight to the hash.
+func (m *Map) AddWithWeight(key string, weight int) {
+	for i := 0; i < weight; i++ {
+		hash := int(m.hash([]byte(strconv.Itoa(i) + key)))
+		m.keys = append(m.keys, hash)
+		m.hashMap[hash] = key
+	}
+	sort.Ints(m.keys)
+}
+
 // Gets the closest item in the hash to the provided key.
 func (m *Map) Get(key string) string {
 	if m.IsEmpty() {
