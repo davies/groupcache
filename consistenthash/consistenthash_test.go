@@ -18,8 +18,11 @@ package consistenthash
 
 import (
 	"fmt"
+	"log"
 	"strconv"
 	"testing"
+
+	"github.com/spaolacci/murmur3"
 )
 
 func TestHashing(t *testing.T) {
@@ -86,6 +89,53 @@ func TestConsistency(t *testing.T) {
 
 }
 
+func testDist(hash *Map, N int, scale float64) (int, int) {
+	hash.init(scale)
+	st := make(map[string]int)
+	result := make(map[int]string)
+	for i := 0; i < N; i++ {
+		h := hash.Get(fmt.Sprintf("key%d", i))
+		result[i] = h
+		st[h]++
+	}
+	//avg := N / len(st)
+	var max, min = 0, N
+	for _, v := range st {
+		//	println(h, v-avg)
+		if v > max {
+			max = v
+		}
+		if v < min {
+			min = v
+		}
+	}
+	var changed int
+	hash.Add("0.0.0.0")
+	hash.init(scale)
+	for i := 0; i < N; i++ {
+		h := hash.Get(fmt.Sprintf("key%d", i))
+		if result[i] != h {
+			changed++
+		}
+	}
+	hash.Remove("0.0.0.0")
+	return max - min, changed
+}
+
+func TestBalance(t *testing.T) {
+	hash := New(3000, murmur3.Sum32)
+	M := 20
+	for i := 0; i < M; i++ {
+		hash.Add(fmt.Sprintf("192.168.%d.%d", i, i))
+	}
+	N := 1000000
+	scales := []float64{-1, 0, 0.5, 0.75, 0.9, 1, 1.5}
+	for _, s := range scales {
+		diff, moved := testDist(hash, N, s)
+		log.Printf("balance %.1f %.1f%% %.1f%%", s, float64(diff)*(float64(M)/float64(N))*100, float64(moved)/float64(N)*100)
+	}
+}
+
 func BenchmarkGet8(b *testing.B)   { benchmarkGet(b, 8) }
 func BenchmarkGet32(b *testing.B)  { benchmarkGet(b, 32) }
 func BenchmarkGet128(b *testing.B) { benchmarkGet(b, 128) }
@@ -93,7 +143,7 @@ func BenchmarkGet512(b *testing.B) { benchmarkGet(b, 512) }
 
 func benchmarkGet(b *testing.B, shards int) {
 
-	hash := New(50, nil)
+	hash := New(3000, nil)
 
 	var buckets []string
 	for i := 0; i < shards; i++ {

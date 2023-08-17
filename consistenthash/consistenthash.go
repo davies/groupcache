@@ -27,16 +27,17 @@ type Hash func(data []byte) uint32
 
 type Map struct {
 	hash     Hash
-	replicas int
+	replica  int
 	keys     []int // Sorted
 	hashMap  map[int]string
+	replicas map[string]int
 }
 
 func New(replicas int, fn Hash) *Map {
 	m := &Map{
-		replicas: replicas,
+		replica:  replicas,
 		hash:     fn,
-		hashMap:  make(map[int]string),
+		replicas: make(map[string]int),
 	}
 	if m.hash == nil {
 		m.hash = crc32.ChecksumIEEE
@@ -46,13 +47,39 @@ func New(replicas int, fn Hash) *Map {
 
 // Returns true if there are no items available.
 func (m *Map) IsEmpty() bool {
-	return len(m.keys) == 0
+	return len(m.replicas) == 0
 }
 
 // Adds some keys to the hash.
 func (m *Map) Add(keys ...string) {
 	for _, key := range keys {
-		for i := 0; i < m.replicas; i++ {
+		m.AddWithWeight(key, m.replica)
+	}
+}
+
+// Adds a key with different replica to the hash.
+func (m *Map) AddWithWeight(key string, replica int) {
+	if replica < 1 {
+		panic("replica should be positive")
+	}
+	old := m.replicas[key]
+	if old != replica {
+		m.hashMap = nil
+		m.replicas[key] = replica
+	}
+}
+
+// Remove a key from hash
+func (m *Map) Remove(key string) {
+	m.hashMap = nil
+	delete(m.replicas, key)
+}
+
+func (m *Map) calc(replicas map[string]int) {
+	m.keys = nil
+	m.hashMap = make(map[int]string)
+	for key, r := range replicas {
+		for i := 0; i < r; i++ {
 			hash := int(m.hash([]byte(strconv.Itoa(i) + key)))
 			m.keys = append(m.keys, hash)
 			m.hashMap[hash] = key
@@ -61,14 +88,33 @@ func (m *Map) Add(keys ...string) {
 	sort.Ints(m.keys)
 }
 
-// Adds a key with different weight to the hash.
-func (m *Map) AddWithWeight(key string, weight int) {
-	for i := 0; i < weight; i++ {
-		hash := int(m.hash([]byte(strconv.Itoa(i) + key)))
-		m.keys = append(m.keys, hash)
-		m.hashMap[hash] = key
+// init the replica for keys
+func (m *Map) init(scale float64) {
+	if m.hashMap != nil {
+		return
 	}
-	sort.Ints(m.keys)
+	m.calc(m.replicas)
+	if len(m.replicas) <= 1 || m.replica < 10 {
+		return
+	}
+	stat := make(map[string]int)
+	stat[m.hashMap[m.keys[0]]] = m.keys[0] + int(1<<32) - m.keys[len(m.keys)-1]
+	for i, h := range m.keys[1:] {
+		stat[m.hashMap[h]] += h - m.keys[i]
+	}
+	var replicas int
+	for _, r := range m.replicas {
+		replicas += r
+	}
+	reps := make(map[string]int)
+	for k, v := range stat {
+		actual := float64(v) / float64(1<<32)
+		rep := m.replicas[k]
+		expect := float64(rep) / float64(replicas)
+		adjust := int(float64(rep) * (expect - actual) / float64(expect) * scale)
+		reps[k] = rep + adjust
+	}
+	m.calc(reps)
 }
 
 // Gets the closest item in the hash to the provided key.
@@ -76,6 +122,7 @@ func (m *Map) Get(key string) string {
 	if m.IsEmpty() {
 		return ""
 	}
+	m.init(1)
 
 	hash := int(m.hash([]byte(key)))
 
