@@ -89,8 +89,8 @@ func TestConsistency(t *testing.T) {
 
 }
 
-func testDist(hash *Map, N int, scale float64) (int, int) {
-	hash.init(scale)
+func testDist(hash *Map, N int, tries int, scale float64) (int, int) {
+	hash.adjust(tries, scale)
 	st := make(map[string]int)
 	result := make(map[int]string)
 	for i := 0; i < N; i++ {
@@ -111,7 +111,7 @@ func testDist(hash *Map, N int, scale float64) (int, int) {
 	}
 	var changed int
 	hash.Add("0.0.0.0")
-	hash.init(scale)
+	hash.adjust(tries, scale)
 	for i := 0; i < N; i++ {
 		h := hash.Get(fmt.Sprintf("key%d", i))
 		if result[i] != h {
@@ -123,16 +123,18 @@ func testDist(hash *Map, N int, scale float64) (int, int) {
 }
 
 func TestBalance(t *testing.T) {
-	hash := New(3000, murmur3.Sum32)
+	hash := New(100, murmur3.Sum32)
 	M := 20
 	for i := 0; i < M; i++ {
 		hash.Add(fmt.Sprintf("192.168.%d.%d", i, i))
 	}
-	N := 1000000
-	scales := []float64{-1, 0, 0.5, 0.75, 0.9, 1, 1.5}
+	N := 100000
+	scales := []float64{0, 0.5, 0.75, 0.9, 1}
 	for _, s := range scales {
-		diff, moved := testDist(hash, N, s)
-		log.Printf("balance %.1f %.1f%% %.1f%%", s, float64(diff)*(float64(M)/float64(N))*100, float64(moved)/float64(N)*100)
+		for t := 1; t < 8; t++ {
+			diff, moved := testDist(hash, N, t, s)
+			log.Printf("balance %.1f %d %.1f%% %.1f%%", s, t, float64(diff)*(float64(M)/float64(N))*100, float64(moved)/float64(N)*100)
+		}
 	}
 }
 

@@ -88,8 +88,8 @@ func (m *Map) calc(replicas map[string]int) {
 	sort.Ints(m.keys)
 }
 
-// init the replica for keys
-func (m *Map) init(scale float64) {
+// adjust the replica for keys
+func (m *Map) adjust(tries int, scale float64) {
 	if m.hashMap != nil {
 		return
 	}
@@ -97,24 +97,35 @@ func (m *Map) init(scale float64) {
 	if len(m.replicas) <= 1 || m.replica < 10 {
 		return
 	}
-	stat := make(map[string]int)
-	stat[m.hashMap[m.keys[0]]] = m.keys[0] + int(1<<32) - m.keys[len(m.keys)-1]
-	for i, h := range m.keys[1:] {
-		stat[m.hashMap[h]] += h - m.keys[i]
-	}
 	var replicas int
-	for _, r := range m.replicas {
+	reps := make(map[string]int)
+	for k, r := range m.replicas {
+		reps[k] = r
 		replicas += r
 	}
-	reps := make(map[string]int)
-	for k, v := range stat {
-		actual := float64(v) / float64(1<<32)
-		rep := m.replicas[k]
-		expect := float64(rep) / float64(replicas)
-		adjust := int(float64(rep) * (expect - actual) / float64(expect) * scale)
-		reps[k] = rep + adjust
+
+	for t := 0; t < tries; t++ {
+		stat := make(map[string]int)
+		stat[m.hashMap[m.keys[0]]] = m.keys[0] + int(1<<32) - m.keys[len(m.keys)-1]
+		for i, h := range m.keys[1:] {
+			stat[m.hashMap[h]] += h - m.keys[i]
+		}
+		var changed bool
+		for k, v := range stat {
+			actual := float64(v) / float64(1<<32)
+			rep := reps[k]
+			expect := float64(m.replicas[k]) / float64(replicas)
+			adjust := int(float64(rep) * (expect - actual) / float64(expect) * scale)
+			if adjust > 1 || adjust < 1 {
+				reps[k] += adjust
+				changed = true
+			}
+		}
+		if !changed {
+			return
+		}
+		m.calc(reps)
 	}
-	m.calc(reps)
 }
 
 // Gets the closest item in the hash to the provided key.
@@ -122,7 +133,7 @@ func (m *Map) Get(key string) string {
 	if m.IsEmpty() {
 		return ""
 	}
-	m.init(1)
+	m.adjust(5, 0.75)
 
 	hash := int(m.hash([]byte(key)))
 
