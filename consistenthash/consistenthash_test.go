@@ -124,7 +124,7 @@ func testDist(hash *Map, N int, tries int, scale float64) (int, int) {
 
 func TestBalance(t *testing.T) {
 	hash := New(100, murmur3.Sum32)
-	M := 20
+	M := 50
 	for i := 0; i < M; i++ {
 		hash.Add(fmt.Sprintf("192.168.%d.%d", i, i))
 	}
@@ -135,6 +135,19 @@ func TestBalance(t *testing.T) {
 			diff, moved := testDist(hash, N, t, s)
 			log.Printf("balance %.1f %d %.1f%% %.1f%%", s, t, float64(diff)*(float64(M)/float64(N))*100, float64(moved)/float64(N)*100)
 		}
+	}
+}
+
+func BenchmarkUpdateRing(b *testing.B) {
+	ring := New(100, murmur3.Sum32)
+	for i := 0; i < 100; i++ {
+		ring.Add(fmt.Sprintf("192.168.%d.%d", i, i))
+	}
+	for i := 0; i < b.N; i++ {
+		ring.Add(fmt.Sprintf("192.169.%d.%d", i, i))
+		ring.Get("")
+		ring.Remove(fmt.Sprintf("192.169.%d.%d", i, i))
+		ring.Get("")
 	}
 }
 
