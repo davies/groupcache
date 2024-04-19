@@ -138,6 +138,48 @@ func TestBalance(t *testing.T) {
 	}
 }
 
+func TestStableHash(t *testing.T) {
+	hash := New(100, murmur3.Sum32)
+	M := 50
+	for i := 0; i < M; i++ {
+		hash.Add(fmt.Sprintf("192.168.%d.%d", i, i))
+	}
+	N := 10000000
+	result := make(map[int]string)
+	for i := 0; i < N; i++ {
+		h := hash.Get(fmt.Sprintf("key%d", i))
+		result[i] = h
+	}
+	hash = New(100, murmur3.Sum32)
+	for i := M - 1; i >= 0; i-- {
+		hash.Add(fmt.Sprintf("192.168.%d.%d", i, i))
+	}
+	for i := N - 1; i >= 0; i-- {
+		h := hash.Get(fmt.Sprintf("key%d", i))
+		if h != result[i] {
+			t.Fatalf("hash changed %d %s %s", i, h, result[i])
+		}
+	}
+}
+
+func TestGet2(t *testing.T) {
+	hash := New(100, murmur3.Sum32)
+	hash.AddWithWeight("node1", 5)
+	n1, n2 := hash.Get2("key1")
+	if n1 != "node1" || n2 != "" {
+		t.Fatalf("get2 %s %s", n1, n2)
+	}
+	hash.AddWithWeight("node2", 5)
+	n1, n2 = hash.Get2("key1")
+	if n1 != "node1" || n2 != "node2" {
+		t.Fatalf("get2 %s %s", n1, n2)
+	}
+	n1, n2 = hash.Get2("key2")
+	if n1 != "node2" || n2 != "node1" {
+		t.Fatalf("get2 %s %s", n1, n2)
+	}
+}
+
 func BenchmarkUpdateRing(b *testing.B) {
 	ring := New(100, murmur3.Sum32)
 	for i := 0; i < 100; i++ {

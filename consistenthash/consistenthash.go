@@ -148,6 +148,11 @@ func (m *Map) Get(key string) string {
 	if m.IsEmpty() {
 		return ""
 	}
+	idx := m.lookup(key)
+	return m.hashMap[m.keys[idx]]
+}
+
+func (m *Map) lookup(key string) int {
 	m.adjust(5, 0.75)
 
 	hash := int(m.hash([]byte(key)))
@@ -159,6 +164,26 @@ func (m *Map) Get(key string) string {
 	if idx == len(m.keys) {
 		idx = 0
 	}
+	return idx
+}
 
-	return m.hashMap[m.keys[idx]]
+// Gets the two items in the hash to the provided key.
+func (m *Map) Get2(key string) (string, string) {
+	if m.IsEmpty() {
+		return "", ""
+	}
+	idx := m.lookup(key)
+	first := m.hashMap[m.keys[idx]]
+	idx2 := idx
+	second := ""
+	if len(m.replicas) > 1 {
+		for m.hashMap[m.keys[idx2]] == first {
+			idx2++
+			if idx2 == len(m.keys) {
+				idx2 = 0
+			}
+		}
+		second = m.hashMap[m.keys[idx2]]
+	}
+	return first, second
 }
