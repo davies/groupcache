@@ -69,14 +69,18 @@ func (m *Map) AddWithWeight(key string, replica int) {
 	if old != replica {
 		m.keys = m.keys[:0]
 		m.replicas[key] = replica
+		m.adjust(5, 0.75)
 	}
 }
 
 // Remove a key from hash
 func (m *Map) Remove(key string) {
-	m.keys = m.keys[:0]
-	delete(m.replicas, key)
-	delete(m.hashs, key)
+	if _, ok := m.replicas[key]; ok {
+		delete(m.replicas, key)
+		delete(m.hashs, key)
+		m.keys = m.keys[:0]
+		m.adjust(5, 0.75)
+	}
 }
 
 func (m *Map) calc(replicas map[string]int) {
@@ -153,8 +157,6 @@ func (m *Map) Get(key string) string {
 }
 
 func (m *Map) lookup(key string) int {
-	m.adjust(5, 0.75)
-
 	hash := int(m.hash([]byte(key)))
 
 	// Binary search for appropriate replica.
