@@ -19,8 +19,12 @@ package consistenthash
 import (
 	"fmt"
 	"log"
+	"reflect"
+	"sort"
 	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/spaolacci/murmur3"
 )
@@ -144,6 +148,7 @@ func TestStableHash(t *testing.T) {
 	for i := 0; i < M; i++ {
 		hash.Add(fmt.Sprintf("192.168.%d.%d", i, i))
 	}
+	hash.Adjust()
 	N := 10000000
 	result := make(map[int]string)
 	for i := 0; i < N; i++ {
@@ -154,6 +159,7 @@ func TestStableHash(t *testing.T) {
 	for i := M - 1; i >= 0; i-- {
 		hash.Add(fmt.Sprintf("192.168.%d.%d", i, i))
 	}
+	hash.Adjust()
 	for i := N - 1; i >= 0; i-- {
 		h := hash.Get(fmt.Sprintf("key%d", i))
 		if h != result[i] {
@@ -177,6 +183,285 @@ func TestGet2(t *testing.T) {
 	n1, n2 = hash.Get2("key2")
 	if n1 != "node2" || n2 != "node1" {
 		t.Fatalf("get2 %s %s", n1, n2)
+	}
+}
+
+func TestIncrementalPreservesActivePoints(test *testing.T) {
+	ring := benchmarkRing(30, 100)
+	keys := append([]int(nil), ring.keys...)
+	owners := make(map[int]string)
+	for hash, node := range ring.hashMap {
+		owners[hash] = node
+	}
+	before := make(map[string]int)
+	for node, count := range ring.active {
+		before[node] = count
+	}
+	ring.Add("added")
+	for node, count := range before {
+		if ring.active[node] != count {
+			test.Fatalf("adding a node changed %s from %d to %d points", node, count, ring.active[node])
+		}
+	}
+	ring.Remove("added")
+	if !reflect.DeepEqual(keys, ring.keys) || !reflect.DeepEqual(owners, ring.hashMap) {
+		test.Fatal("adding then removing a node changed existing routing")
+	}
+	for node, count := range before {
+		if ring.active[node] != count {
+			test.Fatalf("removing a node changed %s", node)
+		}
+	}
+	if !sort.IntsAreSorted(ring.keys) {
+		test.Fatal("incremental update left unsorted points")
+	}
+}
+
+func checkActiveRing(test *testing.T, ring *Map) {
+	test.Helper()
+	expected := make([]int, 0)
+	owners := make(map[int]map[string]int)
+	winners := make(map[int]string)
+	for node, count := range ring.active {
+		for _, hash := range ring.hashs[node][:count] {
+			expected = append(expected, hash)
+			if owners[hash] == nil {
+				owners[hash] = make(map[string]int)
+				winners[hash] = node
+			}
+			owners[hash][node]++
+			if node < winners[hash] {
+				winners[hash] = node
+			}
+		}
+	}
+	sort.Ints(expected)
+	if len(expected) != len(ring.keys) || len(expected) > 0 && !reflect.DeepEqual(expected, ring.keys) {
+		test.Fatal("active point multiset differs from the sorted ring")
+	}
+	for hash, candidates := range owners {
+		var count int
+		for _, replicas := range candidates {
+			count += replicas
+		}
+		if count == 1 {
+			delete(owners, hash)
+		}
+	}
+	if !reflect.DeepEqual(winners, ring.hashMap) || !reflect.DeepEqual(owners, ring.owners) {
+		test.Fatal("point ownership differs from active points")
+	}
+}
+
+func TestIncrementalWeightAndHashCache(test *testing.T) {
+	ring := New(3, murmur3.Sum32)
+	ring.AddWithWeight("first", 12)
+	ring.AddWithWeight("second", 8)
+	ring.calc(map[string]int{"first": 4, "second": 6})
+	for _, weight := range []int{9, 2, 15, 1} {
+		ring.AddWithWeight("first", weight)
+		if ring.active["first"] != weight || ring.active["second"] != 6 {
+			test.Fatal("weight update did not preserve the other node's adjusted count")
+		}
+		checkActiveRing(test, ring)
+	}
+	ring.Remove("first")
+	checkActiveRing(test, ring)
+	ring.AddWithWeight("first", 3)
+	checkActiveRing(test, ring)
+	ring.Adjust()
+	if ring.active["second"] != 8 {
+		test.Fatal("Adjust did not restore configured weights")
+	}
+	checkActiveRing(test, ring)
+	ring.Remove("first")
+	ring.Remove("second")
+	checkActiveRing(test, ring)
+}
+
+func TestIncrementalCollisions(test *testing.T) {
+	ring := New(3, func([]byte) uint32 { return 17 })
+	for _, node := range []string{"c", "a", "b"} {
+		ring.Add(node)
+		checkActiveRing(test, ring)
+	}
+	first, second := ring.Get2("key")
+	if first != "a" || second != "b" {
+		test.Fatalf("unexpected collision owners: %q, %q", first, second)
+	}
+	ring.AddWithWeight("a", 1)
+	ring.Remove("a")
+	checkActiveRing(test, ring)
+	first, second = ring.Get2("key")
+	if first != "b" || second != "c" {
+		test.Fatalf("removed collision winner hid remaining owners: %q, %q", first, second)
+	}
+	ring.Remove("c")
+	ring.Remove("b")
+	checkActiveRing(test, ring)
+	ring.Add("a", "c", "b")
+	ring.Adjust()
+	checkActiveRing(test, ring)
+	first, second = ring.Get2("key")
+	if first != "a" || second != "b" {
+		test.Fatal("collision routing depends on insertion order")
+	}
+}
+
+func TestIncrementalSequences(test *testing.T) {
+	for _, collisions := range []bool{false, true} {
+		ring := New(3, func(key []byte) uint32 {
+			hash := murmur3.Sum32(key)
+			if collisions {
+				return hash % 257
+			}
+			return hash
+		})
+		for index := 0; index < 200; index++ {
+			node := fmt.Sprintf("node-%d", index*7%19)
+			if index%3 == 0 {
+				ring.Remove(node)
+			} else {
+				ring.AddWithWeight(node, 1+index*11%23)
+			}
+			if index%17 == 0 {
+				ring.Adjust()
+			}
+			checkActiveRing(test, ring)
+			if len(ring.replicas) > 1 {
+				first, second := ring.Get2(node)
+				if _, exists := ring.replicas[first]; !exists || first == second {
+					test.Fatal("invalid primary owner")
+				}
+				if _, exists := ring.replicas[second]; !exists {
+					test.Fatal("invalid backup owner")
+				}
+			}
+		}
+	}
+}
+
+func TestIncrementalMatchesFullRebuild(test *testing.T) {
+	incremental, full := New(100, murmur3.Sum32), New(100, murmur3.Sum32)
+	for index := 0; index < 60; index++ {
+		node, weight := fmt.Sprintf("node-%d", index%30), 50+index*5
+		if index%7 == 0 {
+			weight = 0
+		}
+		membershipUpdate(incremental, "incremental-basic", node, weight)
+		membershipUpdate(full, "full-basic", node, weight)
+		fullRebuildAdjust(full)
+		if index%10 == 9 {
+			incremental.Adjust()
+			checkActiveRing(test, incremental)
+			if !reflect.DeepEqual(incremental.keys, full.keys) {
+				test.Fatal("adjusted points differ from the original full rebuild")
+			}
+			for sample := 0; sample < 10000; sample++ {
+				key := strconv.Itoa(sample)
+				first, second := incremental.Get2(key)
+				wantFirst, wantSecond := full.Get2(key)
+				if first != wantFirst || second != wantSecond {
+					test.Fatalf("canonical routing differs for %s", key)
+				}
+			}
+		}
+	}
+}
+
+func TestIncrementalCanonicalLargeRing(test *testing.T) {
+	forward, reverse := New(100, murmur3.Sum32), New(100, murmur3.Sum32)
+	for index := 0; index < 2440; index++ {
+		forward.Add(fmt.Sprintf("node-%d", index))
+		reverse.Add(fmt.Sprintf("node-%d", 2439-index))
+		if index%400 == 399 {
+			forward.Adjust()
+		}
+	}
+	forward.Adjust()
+	reverse.Adjust()
+	checkActiveRing(test, forward)
+	checkActiveRing(test, reverse)
+	if !reflect.DeepEqual(forward.keys, reverse.keys) || !reflect.DeepEqual(forward.hashMap, reverse.hashMap) {
+		test.Fatal("large-ring routing depends on mutation or adjustment order")
+	}
+}
+
+func TestDeferredAdjust(t *testing.T) {
+	ring := New(100, murmur3.Sum32)
+	if ring.Adjust() {
+		t.Fatal("empty ring reported an adjustment")
+	}
+	if ring.Get("key") != "" {
+		t.Fatal("empty ring returned a peer")
+	}
+	for _, node := range []string{"node1", "node2", "node3"} {
+		ring.Add(node)
+	}
+	if !ring.dirty {
+		t.Fatal("membership changes did not mark the ring dirty")
+	}
+	for index := 0; index < 1000; index++ {
+		first, second := ring.Get2(strconv.Itoa(index))
+		if _, exists := ring.replicas[first]; !exists || first == second || second == "" {
+			t.Fatalf("invalid unadjusted lookup: %q, %q", first, second)
+		}
+	}
+	if !ring.Adjust() {
+		t.Fatal("dirty ring did not report an adjustment")
+	}
+	keys := append([]int(nil), ring.keys...)
+	ring.Add("node1")
+	ring.Remove("missing")
+	if ring.Adjust() {
+		t.Fatal("unchanged membership reported an adjustment")
+	}
+	if ring.dirty || !reflect.DeepEqual(keys, ring.keys) {
+		t.Fatal("unchanged membership rebuilt the ring")
+	}
+	ring.Remove("node2")
+	for index := 0; index < 1000; index++ {
+		first, second := ring.Get2(strconv.Itoa(index))
+		if first == "node2" || second == "node2" || first == second {
+			t.Fatalf("removed peer still selected: %q, %q", first, second)
+		}
+	}
+	ring.Remove("node1")
+	ring.Remove("node3")
+	if !ring.Adjust() {
+		t.Fatal("removing the last peers did not report an adjustment")
+	}
+	first, second := ring.Get2("key")
+	if !ring.IsEmpty() || first != "" || second != "" {
+		t.Fatal("removing all peers did not empty the ring")
+	}
+}
+
+func TestDeferredAdjustMatchesEager(t *testing.T) {
+	eager := New(100, murmur3.Sum32)
+	deferred := New(100, murmur3.Sum32)
+	for index := 0; index < 30; index++ {
+		node := fmt.Sprintf("node-%d", index)
+		weight := 50 + index*5
+		eager.AddWithWeight(node, weight)
+		eager.Adjust()
+		deferred.AddWithWeight(node, weight)
+	}
+	for _, ring := range []*Map{eager, deferred} {
+		ring.Remove("node-3")
+		if ring == eager {
+			ring.Adjust()
+		}
+		ring.AddWithWeight("node-7", 250)
+		ring.Adjust()
+	}
+	for index := 0; index < 10000; index++ {
+		key := strconv.Itoa(index)
+		first, second := eager.Get2(key)
+		actualFirst, actualSecond := deferred.Get2(key)
+		if first != actualFirst || second != actualSecond {
+			t.Fatalf("different final routing for %s: (%s, %s) != (%s, %s)", key, first, second, actualFirst, actualSecond)
+		}
 	}
 }
 
@@ -208,10 +493,348 @@ func benchmarkGet(b *testing.B, shards int) {
 	}
 
 	hash.Add(buckets...)
+	hash.Adjust()
 
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
 		hash.Get(buckets[i&(shards-1)])
+	}
+}
+
+func benchmarkRing(nodes, weight int) *Map {
+	ring := New(100, murmur3.Sum32)
+	for index := 0; index < nodes; index++ {
+		ring.replicas[fmt.Sprintf("node-%d", index)] = weight
+	}
+	ring.dirty = true
+	ring.Adjust()
+	return ring
+}
+
+func fullRebuildCalc(ring *Map, replicas map[string]int) {
+	ring.keys = ring.keys[:0]
+	for node, count := range replicas {
+		hashes := ring.hashs[node]
+		for index := 0; index < count; index++ {
+			var hash int
+			if index < len(hashes) {
+				hash = hashes[index]
+			} else {
+				hash = int(ring.hash([]byte(strconv.Itoa(index) + node)))
+				hashes = append(hashes, hash)
+			}
+			ring.keys = append(ring.keys, hash)
+			ring.hashMap[hash] = node
+		}
+		ring.hashs[node] = hashes
+	}
+	sort.Ints(ring.keys)
+}
+
+func fullRebuildAdjust(ring *Map) {
+	if !ring.dirty {
+		return
+	}
+	ring.dirty = false
+	if len(ring.replicas) <= 1 || ring.replica < 10 {
+		return
+	}
+	var total int
+	counts := make(map[string]int, len(ring.replicas))
+	for node, count := range ring.replicas {
+		counts[node] = count
+		total += count
+	}
+	for iteration := 0; iteration < 5; iteration++ {
+		stat := make(map[string]int, len(ring.replicas))
+		stat[ring.hashMap[ring.keys[0]]] = ring.keys[0] + int(1<<32) - ring.keys[len(ring.keys)-1]
+		for index, hash := range ring.keys[1:] {
+			stat[ring.hashMap[hash]] += hash - ring.keys[index]
+		}
+		var changed bool
+		for node, space := range stat {
+			actual := float64(space) / float64(1<<32)
+			expected := float64(ring.replicas[node]) / float64(total)
+			adjustment := int(float64(counts[node]) * (expected - actual) / expected * 0.75)
+			if adjustment > 1 || adjustment < 1 {
+				counts[node] += adjustment
+				changed = true
+			}
+		}
+		if !changed {
+			return
+		}
+		fullRebuildCalc(ring, counts)
+	}
+}
+
+func membershipUpdate(ring *Map, mode, node string, weight int) {
+	if strings.HasPrefix(mode, "full-") {
+		if ring.replicas[node] == weight {
+			return
+		}
+		if weight == 0 {
+			delete(ring.replicas, node)
+			delete(ring.hashs, node)
+		} else {
+			ring.replicas[node] = weight
+		}
+		fullRebuildCalc(ring, ring.replicas)
+		ring.dirty = true
+	} else if weight == 0 {
+		ring.Remove(node)
+	} else {
+		ring.AddWithWeight(node, weight)
+	}
+}
+
+func membershipAdjust(ring *Map, mode string, durations *[]int64) {
+	if !ring.dirty {
+		return
+	}
+	started := time.Now()
+	if strings.HasPrefix(mode, "full-") {
+		fullRebuildAdjust(ring)
+	} else {
+		ring.Adjust()
+	}
+	*durations = append(*durations, time.Since(started).Nanoseconds())
+}
+
+var membershipModes = []string{"full-eager", "full-basic", "full-every100", "incremental-basic", "incremental-every100"}
+
+func BenchmarkMembershipStartup(benchmark *testing.B) {
+	for _, nodes := range []int{100, 600, 1000, 2440} {
+		for _, mode := range membershipModes {
+			benchmark.Run(fmt.Sprintf("nodes=%d/%s", nodes, mode), func(benchmark *testing.B) {
+				var updates, adjustments []int64
+				names := make([]string, nodes)
+				for index := range names {
+					names[index] = fmt.Sprintf("node-%d", index)
+				}
+				benchmark.ReportAllocs()
+				benchmark.ResetTimer()
+				for iteration := 0; iteration < benchmark.N; iteration++ {
+					ring := New(100, murmur3.Sum32)
+					for index, name := range names {
+						started := time.Now()
+						membershipUpdate(ring, mode, name, 100)
+						updates = append(updates, time.Since(started).Nanoseconds())
+						if mode == "full-eager" || strings.HasSuffix(mode, "every100") && (index+1)%100 == 0 {
+							membershipAdjust(ring, mode, &adjustments)
+						}
+					}
+					if strings.HasSuffix(mode, "every100") {
+						membershipAdjust(ring, mode, &adjustments)
+					}
+				}
+				benchmark.StopTimer()
+				reportDurations(benchmark, "update", updates)
+				reportDurations(benchmark, "adjust", adjustments)
+			})
+		}
+	}
+}
+
+func BenchmarkMembershipChurn(benchmark *testing.B) {
+	for _, nodes := range []int{100, 600, 1000, 2440} {
+		for _, mode := range membershipModes {
+			benchmark.Run(fmt.Sprintf("nodes=%d/%s", nodes, mode), func(benchmark *testing.B) {
+				var updates, adjustments []int64
+				benchmark.ReportAllocs()
+				for iteration := 0; iteration < benchmark.N; iteration++ {
+					benchmark.StopTimer()
+					ring := New(100, murmur3.Sum32)
+					for index := 0; index < nodes; index++ {
+						ring.replicas[fmt.Sprintf("node-%d", index)] = 100
+					}
+					ring.dirty = true
+					if strings.HasPrefix(mode, "full-") {
+						fullRebuildCalc(ring, ring.replicas)
+						fullRebuildAdjust(ring)
+					} else {
+						ring.Adjust()
+					}
+					oldNodes := make([]string, nodes/20)
+					newNodes := make([]string, len(oldNodes))
+					for index := range oldNodes {
+						oldNodes[index] = fmt.Sprintf("node-%d", index)
+						newNodes[index] = fmt.Sprintf("replacement-%d", index)
+					}
+					benchmark.StartTimer()
+					for index := range oldNodes {
+						for _, adding := range []bool{false, true} {
+							started := time.Now()
+							if adding {
+								membershipUpdate(ring, mode, newNodes[index], 100)
+							} else {
+								membershipUpdate(ring, mode, oldNodes[index], 0)
+							}
+							updates = append(updates, time.Since(started).Nanoseconds())
+							if mode == "full-eager" {
+								membershipAdjust(ring, mode, &adjustments)
+							}
+						}
+						if strings.HasSuffix(mode, "every100") && (index+1)%50 == 0 {
+							membershipAdjust(ring, mode, &adjustments)
+						}
+					}
+					if strings.HasSuffix(mode, "every100") {
+						membershipAdjust(ring, mode, &adjustments)
+					}
+				}
+				benchmark.StopTimer()
+				reportDurations(benchmark, "update", updates)
+				reportDurations(benchmark, "adjust", adjustments)
+			})
+		}
+	}
+}
+
+func reportDurations(benchmark *testing.B, name string, durations []int64) {
+	if len(durations) == 0 {
+		return
+	}
+	sort.Slice(durations, func(left, right int) bool { return durations[left] < durations[right] })
+	var total int64
+	for _, duration := range durations {
+		total += duration
+	}
+	benchmark.ReportMetric(float64(len(durations))/float64(benchmark.N), name+"-count/op")
+	benchmark.ReportMetric(float64(total)/float64(benchmark.N), name+"-total-ns/op")
+	benchmark.ReportMetric(float64(total)/float64(len(durations)), name+"-mean-ns")
+	benchmark.ReportMetric(float64(durations[(len(durations)*99+99)/100-1]), name+"-p99-ns")
+	benchmark.ReportMetric(float64(durations[len(durations)-1]), name+"-max-ns")
+}
+
+func BenchmarkMembershipAdjust(benchmark *testing.B) {
+	for _, weight := range []int{20, 100, 500} {
+		for _, operation := range []string{"calc", "adjust", "clean-adjust"} {
+			benchmark.Run(fmt.Sprintf("nodes=2440/weight=%d/%s", weight, operation), func(benchmark *testing.B) {
+				ring := benchmarkRing(2440, weight)
+				benchmark.ReportAllocs()
+				benchmark.ResetTimer()
+				for iteration := 0; iteration < benchmark.N; iteration++ {
+					if operation == "calc" {
+						ring.calc(ring.replicas)
+					} else if operation == "adjust" {
+						benchmark.StopTimer()
+						ring.dirty = true
+						benchmark.StartTimer()
+						ring.Adjust()
+					} else {
+						ring.Adjust()
+					}
+				}
+			})
+		}
+	}
+}
+
+func BenchmarkMembershipMutation(benchmark *testing.B) {
+	for _, weight := range []int{20, 100, 500} {
+		for _, mode := range []string{"full-basic", "incremental-basic"} {
+			benchmark.Run(fmt.Sprintf("nodes=2440/weight=%d/%s", weight, mode), func(benchmark *testing.B) {
+				ring := benchmarkRing(2440, weight)
+				var durations []int64
+				benchmark.ReportAllocs()
+				benchmark.ResetTimer()
+				for iteration := 0; iteration < benchmark.N; iteration++ {
+					started := time.Now()
+					membershipUpdate(ring, mode, "node-0", 0)
+					durations = append(durations, time.Since(started).Nanoseconds())
+					started = time.Now()
+					membershipUpdate(ring, mode, "node-0", weight)
+					durations = append(durations, time.Since(started).Nanoseconds())
+				}
+				benchmark.StopTimer()
+				reportDurations(benchmark, "update", durations)
+			})
+		}
+	}
+}
+
+func BenchmarkMembershipLookup(benchmark *testing.B) {
+	for _, mode := range []string{"full", "incremental"} {
+		for _, operation := range []string{"Get", "Get2"} {
+			benchmark.Run(mode+"/"+operation, func(benchmark *testing.B) {
+				ring := benchmarkRing(2440, 100)
+				queries := make([]string, 10000)
+				for index := range queries {
+					queries[index] = strconv.Itoa(index)
+				}
+				benchmark.ReportAllocs()
+				benchmark.ResetTimer()
+				for iteration := 0; iteration < benchmark.N; iteration++ {
+					key := queries[iteration%len(queries)]
+					if operation == "Get" {
+						ring.Get(key)
+					} else if mode == "incremental" {
+						ring.Get2(key)
+					} else {
+						fullRebuildGet2(ring, key)
+					}
+				}
+			})
+		}
+	}
+}
+
+func fullRebuildGet2(ring *Map, key string) (string, string) {
+	if ring.IsEmpty() {
+		return "", ""
+	}
+	index := ring.lookup(key)
+	first := ring.hashMap[ring.keys[index]]
+	second := ""
+	if len(ring.replicas) > 1 {
+		for ring.hashMap[ring.keys[index]] == first {
+			index++
+			if index == len(ring.keys) {
+				index = 0
+			}
+		}
+		second = ring.hashMap[ring.keys[index]]
+	}
+	return first, second
+}
+
+func TestDeferredRoutingMovement(test *testing.T) {
+	for _, weighted := range []bool{false, true} {
+		ring := benchmarkRing(600, 100)
+		if weighted {
+			for index := 0; index < 600; index++ {
+				ring.replicas[fmt.Sprintf("node-%d", index)] = 50 + index%5*50
+			}
+			ring.calc(ring.replicas)
+			ring.dirty = true
+			ring.Adjust()
+		}
+		const samples = 100000
+		before := make([]string, samples)
+		basic := make([]string, samples)
+		for index := range before {
+			before[index] = ring.Get(strconv.Itoa(index))
+		}
+		ring.Add("new-node")
+		var membershipMoved, balanceMoved int
+		for index := range basic {
+			basic[index] = ring.Get(strconv.Itoa(index))
+			if basic[index] != before[index] {
+				membershipMoved++
+				if basic[index] != "new-node" {
+					test.Fatal("adding a node moved a key between existing nodes")
+				}
+			}
+		}
+		ring.Adjust()
+		for index := range basic {
+			if ring.Get(strconv.Itoa(index)) != basic[index] {
+				balanceMoved++
+			}
+		}
+		test.Logf("weighted=%t membership-moved=%.2f%% balance-moved=%.2f%%", weighted,
+			float64(membershipMoved)*100/samples, float64(balanceMoved)*100/samples)
 	}
 }

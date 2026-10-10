@@ -7,6 +7,28 @@ replacement for memcached in many cases.
 
 For API docs and examples, see http://godoc.org/github.com/golang/groupcache
 
+## Explicit consistent-hash balancing
+
+The `github.com/davies/groupcache/consistenthash` package updates routing
+immediately in `Add`, `AddWithWeight`, and `Remove`, but no longer balances
+the distribution automatically. Call `Adjust()` after initialization and at
+application-controlled intervals after membership changes. With no changes,
+`Adjust()` is a no-op. It returns whether a dirty ring was rebuilt, allowing
+callers to exclude idle checks from scheduling measurements. `Get` and `Get2`
+remain read-only.
+
+All mutations, including `Adjust`, require the caller's exclusive lock when
+lookups run concurrently. Queries see the new membership before balancing;
+both membership changes and later balancing can change key placement.
+Membership updates merge or filter only the affected node's active virtual
+points, preserving other nodes' adjusted counts. Changing a weight sets that
+node's active point count to the new weight. `Adjust` rebuilds the canonical
+base ring before balancing, so the final ring is independent of update and
+adjustment history. Virtual-point collisions use the lexicographically smallest
+node name as the primary owner and retain other owners for removal and backup
+lookups. This makes collisions deterministic, unlike the previous map-iteration
+order.
+
 ## Comparison to memcached
 
 ### **Like memcached**, groupcache:
