@@ -29,6 +29,15 @@ node name as the primary owner and retain other owners for removal and backup
 lookups. This makes collisions deterministic, unlike the previous map-iteration
 order.
 
+Balancing retains at least one active point per member, including with small
+weights or colliding hashes. The target distribution remains best effort.
+
+Each node's `hashs` slice uses its length for active points and its capacity for
+initialized cached points. Shrinking keeps the cached tail; growth reuses it and
+hashes only new indices. Full slice expressions bound capacity to initialized
+entries, excluding spare allocation capacity. Cached points stay in generation
+order, and only the active prefix participates in routing.
+
 ## Comparison to memcached
 
 ### **Like memcached**, groupcache:

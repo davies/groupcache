@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/spaolacci/murmur3"
+	twmbmurmur3 "github.com/twmb/murmur3"
 )
 
 func TestHashing(t *testing.T) {
@@ -194,13 +195,13 @@ func TestIncrementalPreservesActivePoints(test *testing.T) {
 		owners[hash] = node
 	}
 	before := make(map[string]int)
-	for node, count := range ring.active {
-		before[node] = count
+	for node, hashes := range ring.hashs {
+		before[node] = len(hashes)
 	}
 	ring.Add("added")
 	for node, count := range before {
-		if ring.active[node] != count {
-			test.Fatalf("adding a node changed %s from %d to %d points", node, count, ring.active[node])
+		if len(ring.hashs[node]) != count {
+			test.Fatalf("adding a node changed %s from %d to %d points", node, count, len(ring.hashs[node]))
 		}
 	}
 	ring.Remove("added")
@@ -208,7 +209,7 @@ func TestIncrementalPreservesActivePoints(test *testing.T) {
 		test.Fatal("adding then removing a node changed existing routing")
 	}
 	for node, count := range before {
-		if ring.active[node] != count {
+		if len(ring.hashs[node]) != count {
 			test.Fatalf("removing a node changed %s", node)
 		}
 	}
@@ -222,8 +223,8 @@ func checkActiveRing(test *testing.T, ring *Map) {
 	expected := make([]int, 0)
 	owners := make(map[int]map[string]int)
 	winners := make(map[int]string)
-	for node, count := range ring.active {
-		for _, hash := range ring.hashs[node][:count] {
+	for node, hashes := range ring.hashs {
+		for _, hash := range hashes {
 			expected = append(expected, hash)
 			if owners[hash] == nil {
 				owners[hash] = make(map[string]int)
@@ -254,15 +255,65 @@ func checkActiveRing(test *testing.T, ring *Map) {
 }
 
 func TestIncrementalWeightAndHashCache(test *testing.T) {
-	ring := New(3, murmur3.Sum32)
+	hashCalls := make(map[string]int)
+	ring := New(3, func(key []byte) uint32 {
+		hashCalls[string(key)]++
+		return murmur3.Sum32(key)
+	})
 	ring.AddWithWeight("first", 12)
 	ring.AddWithWeight("second", 8)
 	ring.calc(map[string]int{"first": 4, "second": 6})
-	for _, weight := range []int{9, 2, 15, 1} {
+	if len(ring.hashs["first"]) != 4 || len(ring.hashs["second"]) != 6 {
+		test.Fatal("calc did not set the active hash lengths")
+	}
+	cached := 12
+	checkCache := func() {
+		test.Helper()
+		if cap(ring.hashs["first"]) != cached || cap(ring.hashs["second"]) != 8 {
+			test.Fatal("hash capacity differs from the generated point count")
+		}
+		for node, hashes := range ring.hashs {
+			for index, hash := range hashes[:cap(hashes)] {
+				key := strconv.Itoa(index) + node
+				if hash != int(murmur3.Sum32([]byte(key))) || hashCalls[key] != 1 {
+					test.Fatalf("cached point %s was not generated exactly once or changed value", key)
+				}
+			}
+		}
+	}
+	checkCache()
+	for _, weight := range []int{9, 2, 15, 1, 15, 16, 17, 33, 2, 32} {
 		ring.AddWithWeight("first", weight)
-		if ring.active["first"] != weight || ring.active["second"] != 6 {
+		if weight > cached {
+			cached = weight
+		}
+		if len(ring.hashs["first"]) != weight || len(ring.hashs["second"]) != 6 {
 			test.Fatal("weight update did not preserve the other node's adjusted count")
 		}
+		checkCache()
+		checkActiveRing(test, ring)
+	}
+	for _, counts := range []map[string]int{
+		{"first": 40, "second": 6},
+		{"first": 0, "second": -1},
+		{"first": 5, "second": 6},
+		{"first": 40, "second": 6},
+		{"second": 6},
+	} {
+		ring.calc(counts)
+		if counts["first"] > cached {
+			cached = counts["first"]
+		}
+		for node, hashes := range ring.hashs {
+			count := counts[node]
+			if count < 0 {
+				count = 0
+			}
+			if len(hashes) != count {
+				test.Fatalf("calc left %s with %d active points, want %d", node, len(hashes), count)
+			}
+		}
+		checkCache()
 		checkActiveRing(test, ring)
 	}
 	ring.Remove("first")
@@ -270,7 +321,7 @@ func TestIncrementalWeightAndHashCache(test *testing.T) {
 	ring.AddWithWeight("first", 3)
 	checkActiveRing(test, ring)
 	ring.Adjust()
-	if ring.active["second"] != 8 {
+	if len(ring.hashs["second"]) != 8 {
 		test.Fatal("Adjust did not restore configured weights")
 	}
 	checkActiveRing(test, ring)
@@ -305,6 +356,82 @@ func TestIncrementalCollisions(test *testing.T) {
 	first, second = ring.Get2("key")
 	if first != "a" || second != "b" {
 		test.Fatal("collision routing depends on insertion order")
+	}
+}
+
+func TestDeferredAdjustCollisions(test *testing.T) {
+	for _, nodes := range []int{3, 5} {
+		test.Run(fmt.Sprintf("nodes=%d", nodes), func(test *testing.T) {
+			ring := New(100, func([]byte) uint32 { return 17 })
+			for index := 0; index < nodes; index++ {
+				ring.Add(fmt.Sprintf("node-%d", index))
+			}
+			checkRouting := func(first, second string) {
+				test.Helper()
+				if !ring.Adjust() {
+					test.Fatal("membership changes did not trigger adjustment")
+				}
+				checkActiveRing(test, ring)
+				for node := range ring.replicas {
+					if len(ring.hashs[node]) < 1 {
+						test.Fatalf("adjustment removed every point of %s", node)
+					}
+				}
+				if owner := ring.Get("key"); owner != first {
+					test.Fatalf("primary owner = %q, want %q", owner, first)
+				}
+				if primary, backup := ring.Get2("key"); primary != first || backup != second {
+					test.Fatalf("owners = (%q, %q), want (%q, %q)", primary, backup, first, second)
+				}
+			}
+			checkRouting("node-0", "node-1")
+			keys := append([]int(nil), ring.keys...)
+			ring.Remove("node-0")
+			checkRouting("node-1", "node-2")
+			ring.Add("node-0")
+			checkRouting("node-0", "node-1")
+			if !reflect.DeepEqual(keys, ring.keys) {
+				test.Fatal("collision ring depends on membership history")
+			}
+		})
+	}
+}
+
+func TestDeferredAdjustSmallPeerWeights(test *testing.T) {
+	nodes := []string{"172.31.0.0", "172.31.40.106", "172.31.45.195"}
+	var canonical *Map
+	for _, eager := range []bool{false, true} {
+		test.Run(fmt.Sprintf("eager=%t", eager), func(test *testing.T) {
+			ring := New(100, twmbmurmur3.Sum32)
+			for _, node := range nodes {
+				ring.AddWithWeight(node, 2)
+				if eager {
+					ring.Adjust()
+				}
+			}
+			if len(ring.hashMap) != len(ring.keys) {
+				test.Fatal("small-weight reproduction unexpectedly contains collisions")
+			}
+			ring.Adjust()
+			checkActiveRing(test, ring)
+			for _, node := range nodes {
+				if len(ring.hashs[node]) < 1 || ring.replicas[node] != 2 {
+					test.Fatalf("adjustment removed %s or changed its configured weight", node)
+				}
+			}
+			for sample := 0; sample < 1000; sample++ {
+				key := strconv.Itoa(sample)
+				first, second := ring.Get2(key)
+				if ring.replicas[first] != 2 || ring.replicas[second] != 2 || first == second || ring.Get(key) != first {
+					test.Fatalf("invalid small-weight routing for %s: (%q, %q)", key, first, second)
+				}
+			}
+			if canonical == nil {
+				canonical = ring
+			} else if !reflect.DeepEqual(canonical.keys, ring.keys) || !reflect.DeepEqual(canonical.hashMap, ring.hashMap) {
+				test.Fatal("small-weight ring depends on adjustment history")
+			}
+		})
 	}
 }
 
@@ -440,27 +567,36 @@ func TestDeferredAdjust(t *testing.T) {
 func TestDeferredAdjustMatchesEager(t *testing.T) {
 	eager := New(100, murmur3.Sum32)
 	deferred := New(100, murmur3.Sum32)
+	cached := New(100, murmur3.Sum32)
 	for index := 0; index < 30; index++ {
 		node := fmt.Sprintf("node-%d", index)
 		weight := 50 + index*5
 		eager.AddWithWeight(node, weight)
 		eager.Adjust()
 		deferred.AddWithWeight(node, weight)
+		cached.AddWithWeight(node, weight+500)
+		cached.AddWithWeight(node, weight)
 	}
-	for _, ring := range []*Map{eager, deferred} {
+	for _, ring := range []*Map{eager, deferred, cached} {
 		ring.Remove("node-3")
 		if ring == eager {
 			ring.Adjust()
 		}
 		ring.AddWithWeight("node-7", 250)
 		ring.Adjust()
+		checkActiveRing(t, ring)
 	}
-	for index := 0; index < 10000; index++ {
-		key := strconv.Itoa(index)
-		first, second := eager.Get2(key)
-		actualFirst, actualSecond := deferred.Get2(key)
-		if first != actualFirst || second != actualSecond {
-			t.Fatalf("different final routing for %s: (%s, %s) != (%s, %s)", key, first, second, actualFirst, actualSecond)
+	for _, ring := range []*Map{deferred, cached} {
+		if !reflect.DeepEqual(eager.keys, ring.keys) || !reflect.DeepEqual(eager.hashMap, ring.hashMap) || !reflect.DeepEqual(eager.owners, ring.owners) {
+			t.Fatal("final ring depends on adjustment or hash cache history")
+		}
+		for index := 0; index < 10000; index++ {
+			key := strconv.Itoa(index)
+			first, second := eager.Get2(key)
+			actualFirst, actualSecond := ring.Get2(key)
+			if first != actualFirst || second != actualSecond {
+				t.Fatalf("different final routing for %s: (%s, %s) != (%s, %s)", key, first, second, actualFirst, actualSecond)
+			}
 		}
 	}
 }

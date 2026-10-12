@@ -32,7 +32,6 @@ type Map struct {
 	hashMap  map[int]string
 	hashs    map[string][]int
 	replicas map[string]int
-	active   map[string]int
 	owners   map[int]map[string]int
 	dirty    bool
 }
@@ -44,7 +43,6 @@ func New(replicas int, fn Hash) *Map {
 		replicas: make(map[string]int),
 		hashs:    make(map[string][]int),
 		hashMap:  make(map[int]string),
-		active:   make(map[string]int),
 		owners:   make(map[int]map[string]int),
 	}
 	if m.hash == nil {
@@ -85,7 +83,6 @@ func (m *Map) Remove(key string) {
 		m.updatePoints(key, 0)
 		delete(m.replicas, key)
 		delete(m.hashs, key)
-		delete(m.active, key)
 		m.dirty = true
 	}
 }
@@ -136,15 +133,15 @@ func (m *Map) removePoint(hash int, key string) {
 }
 
 func (m *Map) updatePoints(key string, count int) {
-	previous := m.active[key]
+	hashes := m.hashs[key]
+	previous := len(hashes)
 	if count == previous {
 		return
 	}
-	hashes := m.hashs[key]
+	hashes = hashes[:cap(hashes)]
 	for index := len(hashes); index < count; index++ {
 		hashes = append(hashes, int(m.hash([]byte(strconv.Itoa(index)+key))))
 	}
-	m.hashs[key] = hashes
 	if count > previous {
 		added := append([]int(nil), hashes[previous:count]...)
 		sort.Ints(added)
@@ -180,7 +177,7 @@ func (m *Map) updatePoints(key string, count int) {
 			m.removePoint(hash, key)
 		}
 	}
-	m.active[key] = count
+	m.hashs[key] = hashes[:count:len(hashes)]
 }
 
 // Adjust balances the ring after membership changes and reports whether it rebuilt
@@ -198,26 +195,24 @@ func (m *Map) calc(replicas map[string]int) {
 	for hash := range m.owners {
 		delete(m.owners, hash)
 	}
-	for key := range m.active {
-		delete(m.active, key)
+	for key, hashes := range m.hashs {
+		m.hashs[key] = hashes[:0]
 	}
 	m.keys = m.keys[:0]
-	for key, r := range replicas {
-		hs := m.hashs[key]
-		for i := 0; i < r; i++ {
-			var hash int
-			if i < len(hs) {
-				hash = hs[i]
-			} else {
-				hash = int(m.hash([]byte(strconv.Itoa(i) + key)))
-				hs = append(hs, hash)
-			}
-			m.keys = append(m.keys, hash)
-			m.addPoint(hash, key)
+	for key, count := range replicas {
+		if count < 0 {
+			count = 0
 		}
-		m.hashs[key] = hs
-		if r > 0 {
-			m.active[key] = r
+		hashes := m.hashs[key]
+		hashes = hashes[:cap(hashes)]
+		for index := len(hashes); index < count; index++ {
+			hashes = append(hashes, int(m.hash([]byte(strconv.Itoa(index)+key))))
+		}
+		hashes = hashes[:count:len(hashes)]
+		m.hashs[key] = hashes
+		m.keys = append(m.keys, hashes...)
+		for _, hash := range hashes {
+			m.addPoint(hash, key)
 		}
 	}
 	sort.Ints(m.keys)
@@ -254,6 +249,9 @@ func (m *Map) adjust(tries int, scale float64) {
 			adjust := int(float64(rep) * (expect - actual) / float64(expect) * scale)
 			if adjust > 1 || adjust < 1 {
 				reps[k] += adjust
+				if reps[k] < 1 {
+					reps[k] = 1
+				}
 				changed = true
 			}
 		}
