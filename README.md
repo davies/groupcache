@@ -24,7 +24,9 @@ Membership updates merge or filter only the affected node's active virtual
 points, preserving other nodes' adjusted counts. Changing a weight sets that
 node's active point count to the new weight. `Adjust` rebuilds the canonical
 base ring before balancing, so the final ring is independent of update and
-adjustment history. Virtual-point collisions use the lexicographically smallest
+adjustment history. Each balancing round applies all point changes in one
+filter/merge of the sorted ring, preserving unchanged points and ownership.
+Virtual-point collisions use the lexicographically smallest
 node name as the primary owner and retain other owners for removal and backup
 lookups. This makes collisions deterministic, unlike the previous map-iteration
 order.

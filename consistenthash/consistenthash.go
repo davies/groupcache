@@ -141,8 +141,37 @@ func (m *Map) updatePoints(key string, count int) {
 	for index := len(hashes); index < count; index++ {
 		hashes = append(hashes, int(m.hash([]byte(strconv.Itoa(index)+key))))
 	}
+	var added, removed []int
 	if count > previous {
-		added := append([]int(nil), hashes[previous:count]...)
+		added = append([]int(nil), hashes[previous:count]...)
+		for _, hash := range added {
+			m.addPoint(hash, key)
+		}
+	} else {
+		removed = append([]int(nil), hashes[count:previous]...)
+		for _, hash := range removed {
+			m.removePoint(hash, key)
+		}
+	}
+	m.hashs[key] = hashes[:count]
+	m.updateKeys(added, removed)
+}
+
+func (m *Map) updateKeys(added, removed []int) {
+	if len(removed) > 0 {
+		sort.Ints(removed)
+		kept, consumed := 0, 0
+		for _, hash := range m.keys {
+			if consumed < len(removed) && hash == removed[consumed] {
+				consumed++
+			} else {
+				m.keys[kept] = hash
+				kept++
+			}
+		}
+		m.keys = m.keys[:kept]
+	}
+	if len(added) > 0 {
 		sort.Ints(added)
 		remaining := len(m.keys) - 1
 		m.keys = append(m.keys, added...)
@@ -156,27 +185,43 @@ func (m *Map) updatePoints(key string, count int) {
 				incoming--
 			}
 		}
-		for _, hash := range added {
-			m.addPoint(hash, key)
-		}
-	} else {
-		removed := append([]int(nil), hashes[count:previous]...)
-		sort.Ints(removed)
-		kept, consumed := 0, 0
-		for _, hash := range m.keys {
-			if consumed < len(removed) && hash == removed[consumed] {
-				consumed++
-			} else {
-				m.keys[kept] = hash
-				kept++
-			}
-		}
-		m.keys = m.keys[:kept]
-		for _, hash := range removed {
-			m.removePoint(hash, key)
+	}
+}
+
+func (m *Map) updateRing(replicas map[string]int) {
+	var additions, removals int
+	for key, count := range replicas {
+		previous := len(m.hashs[key])
+		if count > previous {
+			additions += count - previous
+		} else {
+			removals += previous - count
 		}
 	}
-	m.hashs[key] = hashes[:count]
+	added := make([]int, 0, additions)
+	removed := make([]int, 0, removals)
+	for key, count := range replicas {
+		hashes := m.hashs[key]
+		previous := len(hashes)
+		if count == previous {
+			continue
+		}
+		if count > previous {
+			for index := previous; index < count; index++ {
+				hash := int(m.hash([]byte(strconv.Itoa(index) + key)))
+				hashes = append(hashes, hash)
+				added = append(added, hash)
+				m.addPoint(hash, key)
+			}
+		} else {
+			removed = append(removed, hashes[count:previous]...)
+			for _, hash := range hashes[count:previous] {
+				m.removePoint(hash, key)
+			}
+		}
+		m.hashs[key] = hashes[:count]
+	}
+	m.updateKeys(added, removed)
 }
 
 // Adjust balances the ring after membership changes and reports whether it rebuilt
@@ -258,7 +303,7 @@ func (m *Map) adjust(tries int, scale float64) {
 		if !changed {
 			return
 		}
-		m.calc(reps)
+		m.updateRing(reps)
 	}
 }
 

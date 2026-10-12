@@ -521,7 +521,7 @@ func TestIncrementalMatchesFullRebuild(test *testing.T) {
 		membershipUpdate(full, "full-basic", node, weight)
 		if index%10 == 9 {
 			incremental.Adjust()
-			full.Adjust()
+			adjustByRebuilding(full, 5, 0.75)
 			checkActiveRing(test, incremental)
 			if !reflect.DeepEqual(incremental.keys, full.keys) {
 				test.Fatal("adjusted points differ from full membership rebuilding")
@@ -535,6 +535,95 @@ func TestIncrementalMatchesFullRebuild(test *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func adjustByRebuilding(ring *Map, tries int, scale float64) {
+	if !ring.dirty {
+		return
+	}
+	ring.dirty = false
+	ring.calc(ring.replicas)
+	if len(ring.replicas) <= 1 || ring.replica < 10 {
+		return
+	}
+	var total int
+	counts := make(map[string]int, len(ring.replicas))
+	for node, count := range ring.replicas {
+		counts[node] = count
+		total += count
+	}
+	for iteration := 0; iteration < tries; iteration++ {
+		stat := make(map[string]int, len(ring.replicas))
+		stat[ring.hashMap[ring.keys[0]]] = ring.keys[0] + int(1<<32) - ring.keys[len(ring.keys)-1]
+		for index, hash := range ring.keys[1:] {
+			stat[ring.hashMap[hash]] += hash - ring.keys[index]
+		}
+		var changed bool
+		for node, space := range stat {
+			actual := float64(space) / float64(1<<32)
+			expected := float64(ring.replicas[node]) / float64(total)
+			adjustment := int(float64(counts[node]) * (expected - actual) / expected * scale)
+			if adjustment > 1 || adjustment < -1 {
+				counts[node] += adjustment
+				if counts[node] < 1 {
+					counts[node] = 1
+				}
+				changed = true
+			}
+		}
+		if !changed {
+			return
+		}
+		ring.calc(counts)
+	}
+}
+
+func TestIncrementalAdjustmentRounds(test *testing.T) {
+	for _, scenario := range []struct {
+		name   string
+		nodes  int
+		weight int
+		hash   Hash
+	}{
+		{"empty", 0, 100, murmur3.Sum32},
+		{"single", 1, 100, murmur3.Sum32},
+		{"murmur3", 60, 20, murmur3.Sum32},
+		{"collisions", 60, 20, func(key []byte) uint32 { return murmur3.Sum32(key) % 257 }},
+		{"constant", 60, 20, func([]byte) uint32 { return 17 }},
+		{"small-weights", 3, 1, twmbmurmur3.Sum32},
+		{"large", 2440, 100, murmur3.Sum32},
+	} {
+		test.Run(scenario.name, func(test *testing.T) {
+			for rounds := 0; rounds <= 5; rounds++ {
+				incremental, full := New(100, scenario.hash), New(100, scenario.hash)
+				initial := make(map[string]int, scenario.nodes)
+				for index := 0; index < scenario.nodes; index++ {
+					node, weight := fmt.Sprintf("node-%d", index), scenario.weight*(1+index%5)
+					initial[node] = weight + 30
+					incremental.replicas[node] = weight
+					full.replicas[node] = weight
+				}
+				incremental.calc(initial)
+				incremental.calc(incremental.replicas)
+				incremental.dirty = true
+				full.dirty = true
+				incremental.adjust(rounds, 0.75)
+				adjustByRebuilding(full, rounds, 0.75)
+				checkActiveRing(test, incremental)
+				if !reflect.DeepEqual(incremental.keys, full.keys) || !reflect.DeepEqual(incremental.hashMap, full.hashMap) || !reflect.DeepEqual(incremental.owners, full.owners) || !reflect.DeepEqual(incremental.hashs, full.hashs) {
+					test.Fatalf("ring differs from full rebuilding after %d rounds", rounds)
+				}
+				for sample := 0; sample < 1000; sample++ {
+					key := strconv.Itoa(sample)
+					first, second := incremental.Get2(key)
+					wantFirst, wantSecond := full.Get2(key)
+					if first != wantFirst || second != wantSecond || incremental.Get(key) != full.Get(key) {
+						test.Fatalf("routing differs after %d rounds for %s", rounds, key)
+					}
+				}
+			}
+		})
 	}
 }
 
