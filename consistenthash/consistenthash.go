@@ -138,7 +138,6 @@ func (m *Map) updatePoints(key string, count int) {
 	if count == previous {
 		return
 	}
-	hashes = hashes[:cap(hashes)]
 	for index := len(hashes); index < count; index++ {
 		hashes = append(hashes, int(m.hash([]byte(strconv.Itoa(index)+key))))
 	}
@@ -177,7 +176,7 @@ func (m *Map) updatePoints(key string, count int) {
 			m.removePoint(hash, key)
 		}
 	}
-	m.hashs[key] = hashes[:count:len(hashes)]
+	m.hashs[key] = hashes[:count]
 }
 
 // Adjust balances the ring after membership changes and reports whether it rebuilt
@@ -196,7 +195,9 @@ func (m *Map) calc(replicas map[string]int) {
 		delete(m.owners, hash)
 	}
 	for key, hashes := range m.hashs {
-		m.hashs[key] = hashes[:0]
+		if _, exists := replicas[key]; !exists {
+			m.hashs[key] = hashes[:0]
+		}
 	}
 	m.keys = m.keys[:0]
 	for key, count := range replicas {
@@ -204,11 +205,10 @@ func (m *Map) calc(replicas map[string]int) {
 			count = 0
 		}
 		hashes := m.hashs[key]
-		hashes = hashes[:cap(hashes)]
 		for index := len(hashes); index < count; index++ {
 			hashes = append(hashes, int(m.hash([]byte(strconv.Itoa(index)+key))))
 		}
-		hashes = hashes[:count:len(hashes)]
+		hashes = hashes[:count]
 		m.hashs[key] = hashes
 		m.keys = append(m.keys, hashes...)
 		for _, hash := range hashes {
@@ -247,7 +247,7 @@ func (m *Map) adjust(tries int, scale float64) {
 			rep := reps[k]
 			expect := float64(m.replicas[k]) / float64(replicas)
 			adjust := int(float64(rep) * (expect - actual) / float64(expect) * scale)
-			if adjust > 1 || adjust < 1 {
+			if adjust > 1 || adjust < -1 {
 				reps[k] += adjust
 				if reps[k] < 1 {
 					reps[k] = 1

@@ -254,10 +254,10 @@ func checkActiveRing(test *testing.T, ring *Map) {
 	}
 }
 
-func TestIncrementalWeightAndHashCache(test *testing.T) {
-	hashCalls := make(map[string]int)
+func TestIncrementalWeightAndHashes(test *testing.T) {
+	hashCalls := 0
 	ring := New(3, func(key []byte) uint32 {
-		hashCalls[string(key)]++
+		hashCalls++
 		return murmur3.Sum32(key)
 	})
 	ring.AddWithWeight("first", 12)
@@ -266,46 +266,45 @@ func TestIncrementalWeightAndHashCache(test *testing.T) {
 	if len(ring.hashs["first"]) != 4 || len(ring.hashs["second"]) != 6 {
 		test.Fatal("calc did not set the active hash lengths")
 	}
-	cached := 12
-	checkCache := func() {
+	checkHashes := func(expectedCalls int) {
 		test.Helper()
-		if cap(ring.hashs["first"]) != cached || cap(ring.hashs["second"]) != 8 {
-			test.Fatal("hash capacity differs from the generated point count")
+		if hashCalls != expectedCalls {
+			test.Fatalf("hash calls = %d, want %d", hashCalls, expectedCalls)
 		}
 		for node, hashes := range ring.hashs {
-			for index, hash := range hashes[:cap(hashes)] {
+			for index, hash := range hashes {
 				key := strconv.Itoa(index) + node
-				if hash != int(murmur3.Sum32([]byte(key))) || hashCalls[key] != 1 {
-					test.Fatalf("cached point %s was not generated exactly once or changed value", key)
+				if hash != int(murmur3.Sum32([]byte(key))) {
+					test.Fatalf("active point %s changed value", key)
 				}
 			}
 		}
 	}
-	checkCache()
-	for _, weight := range []int{9, 2, 15, 1, 15, 16, 17, 33, 2, 32} {
-		ring.AddWithWeight("first", weight)
-		if weight > cached {
-			cached = weight
-		}
-		if len(ring.hashs["first"]) != weight || len(ring.hashs["second"]) != 6 {
+	checkHashes(20)
+	for _, step := range []struct{ weight, calls int }{
+		{9, 25}, {2, 25}, {15, 38}, {1, 38}, {15, 52},
+		{16, 53}, {17, 54}, {33, 70}, {2, 70}, {32, 100},
+	} {
+		ring.AddWithWeight("first", step.weight)
+		if len(ring.hashs["first"]) != step.weight || len(ring.hashs["second"]) != 6 {
 			test.Fatal("weight update did not preserve the other node's adjusted count")
 		}
-		checkCache()
+		checkHashes(step.calls)
 		checkActiveRing(test, ring)
 	}
-	for _, counts := range []map[string]int{
-		{"first": 40, "second": 6},
-		{"first": 0, "second": -1},
-		{"first": 5, "second": 6},
-		{"first": 40, "second": 6},
-		{"second": 6},
+	for _, step := range []struct {
+		counts map[string]int
+		calls  int
+	}{
+		{map[string]int{"first": 40, "second": 6}, 108},
+		{map[string]int{"first": 0, "second": -1}, 108},
+		{map[string]int{"first": 5, "second": 6}, 119},
+		{map[string]int{"first": 40, "second": 6}, 154},
+		{map[string]int{"second": 6}, 154},
 	} {
-		ring.calc(counts)
-		if counts["first"] > cached {
-			cached = counts["first"]
-		}
+		ring.calc(step.counts)
 		for node, hashes := range ring.hashs {
-			count := counts[node]
+			count := step.counts[node]
 			if count < 0 {
 				count = 0
 			}
@@ -313,7 +312,7 @@ func TestIncrementalWeightAndHashCache(test *testing.T) {
 				test.Fatalf("calc left %s with %d active points, want %d", node, len(hashes), count)
 			}
 		}
-		checkCache()
+		checkHashes(step.calls)
 		checkActiveRing(test, ring)
 	}
 	ring.Remove("first")
@@ -324,6 +323,7 @@ func TestIncrementalWeightAndHashCache(test *testing.T) {
 	if len(ring.hashs["second"]) != 8 {
 		test.Fatal("Adjust did not restore configured weights")
 	}
+	checkHashes(159)
 	checkActiveRing(test, ring)
 	ring.Remove("first")
 	ring.Remove("second")
@@ -435,6 +435,48 @@ func TestDeferredAdjustSmallPeerWeights(test *testing.T) {
 	}
 }
 
+func TestDeferredAdjustmentThreshold(test *testing.T) {
+	for _, scenario := range []struct {
+		adjustment int
+		position   uint32
+		first      int
+		second     int
+	}{
+		{-2, 5 << 28, 8, 12},
+		{-1, 6 << 28, 10, 10},
+		{0, 8 << 28, 10, 10},
+		{1, 10 << 28, 10, 10},
+		{2, 11 << 28, 12, 8},
+	} {
+		test.Run(fmt.Sprintf("adjustment=%d", scenario.adjustment), func(test *testing.T) {
+			ring := New(10, func(key []byte) uint32 {
+				if strings.HasSuffix(string(key), "second") {
+					return scenario.position
+				}
+				return 0
+			})
+			ring.Add("first", "second")
+			ring.adjust(1, 0.75)
+			if len(ring.hashs["first"]) != scenario.first || len(ring.hashs["second"]) != scenario.second {
+				test.Fatalf("active counts = (%d, %d), want (%d, %d)", len(ring.hashs["first"]), len(ring.hashs["second"]), scenario.first, scenario.second)
+			}
+			checkActiveRing(test, ring)
+			if scenario.adjustment >= -1 && scenario.adjustment <= 1 {
+				var allocations [2]float64
+				for index, tries := range []int{1, 5} {
+					allocations[index] = testing.AllocsPerRun(10, func() {
+						ring.dirty = true
+						ring.adjust(tries, 0.75)
+					})
+				}
+				if allocations[1] > allocations[0] {
+					test.Fatalf("small adjustments caused redundant rebuilds: allocations %.0f -> %.0f", allocations[0], allocations[1])
+				}
+			}
+		})
+	}
+}
+
 func TestIncrementalSequences(test *testing.T) {
 	for _, collisions := range []bool{false, true} {
 		ring := New(3, func(key []byte) uint32 {
@@ -477,12 +519,12 @@ func TestIncrementalMatchesFullRebuild(test *testing.T) {
 		}
 		membershipUpdate(incremental, "incremental-basic", node, weight)
 		membershipUpdate(full, "full-basic", node, weight)
-		fullRebuildAdjust(full)
 		if index%10 == 9 {
 			incremental.Adjust()
+			full.Adjust()
 			checkActiveRing(test, incremental)
 			if !reflect.DeepEqual(incremental.keys, full.keys) {
-				test.Fatal("adjusted points differ from the original full rebuild")
+				test.Fatal("adjusted points differ from full membership rebuilding")
 			}
 			for sample := 0; sample < 10000; sample++ {
 				key := strconv.Itoa(sample)
@@ -567,17 +609,17 @@ func TestDeferredAdjust(t *testing.T) {
 func TestDeferredAdjustMatchesEager(t *testing.T) {
 	eager := New(100, murmur3.Sum32)
 	deferred := New(100, murmur3.Sum32)
-	cached := New(100, murmur3.Sum32)
+	resized := New(100, murmur3.Sum32)
 	for index := 0; index < 30; index++ {
 		node := fmt.Sprintf("node-%d", index)
 		weight := 50 + index*5
 		eager.AddWithWeight(node, weight)
 		eager.Adjust()
 		deferred.AddWithWeight(node, weight)
-		cached.AddWithWeight(node, weight+500)
-		cached.AddWithWeight(node, weight)
+		resized.AddWithWeight(node, weight+500)
+		resized.AddWithWeight(node, weight)
 	}
-	for _, ring := range []*Map{eager, deferred, cached} {
+	for _, ring := range []*Map{eager, deferred, resized} {
 		ring.Remove("node-3")
 		if ring == eager {
 			ring.Adjust()
@@ -586,9 +628,9 @@ func TestDeferredAdjustMatchesEager(t *testing.T) {
 		ring.Adjust()
 		checkActiveRing(t, ring)
 	}
-	for _, ring := range []*Map{deferred, cached} {
+	for _, ring := range []*Map{deferred, resized} {
 		if !reflect.DeepEqual(eager.keys, ring.keys) || !reflect.DeepEqual(eager.hashMap, ring.hashMap) || !reflect.DeepEqual(eager.owners, ring.owners) {
-			t.Fatal("final ring depends on adjustment or hash cache history")
+			t.Fatal("final ring depends on adjustment or weight history")
 		}
 		for index := 0; index < 10000; index++ {
 			key := strconv.Itoa(index)

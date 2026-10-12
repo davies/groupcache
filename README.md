@@ -30,13 +30,15 @@ lookups. This makes collisions deterministic, unlike the previous map-iteration
 order.
 
 Balancing retains at least one active point per member, including with small
-weights or colliding hashes. The target distribution remains best effort.
+weights or colliding hashes. Only adjustments greater than one point in magnitude
+are applied; zero and one-point adjustments in either direction are ignored.
+The target distribution remains best effort. This symmetric threshold can change
+the final routing compared with the historical balancing algorithm.
 
-Each node's `hashs` slice uses its length for active points and its capacity for
-initialized cached points. Shrinking keeps the cached tail; growth reuses it and
-hashes only new indices. Full slice expressions bound capacity to initialized
-entries, excluding spare allocation capacity. Cached points stay in generation
-order, and only the active prefix participates in routing.
+Each node's `hashs` slice contains only its active points, in generation order.
+Shrinking truncates the slice; growth reuses the active prefix and computes the
+additional points by index. Slice capacity is ordinary allocation space, not a
+cache of previously generated points.
 
 ## Comparison to memcached
 
