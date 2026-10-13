@@ -32,6 +32,8 @@ type Map struct {
 	hashMap  map[int]string
 	hashs    map[string][]int
 	replicas map[string]int
+	owners   map[int]map[string]int
+	dirty    bool
 }
 
 func New(replicas int, fn Hash) *Map {
@@ -41,6 +43,7 @@ func New(replicas int, fn Hash) *Map {
 		replicas: make(map[string]int),
 		hashs:    make(map[string][]int),
 		hashMap:  make(map[int]string),
+		owners:   make(map[int]map[string]int),
 	}
 	if m.hash == nil {
 		m.hash = crc32.ChecksumIEEE
@@ -53,65 +56,219 @@ func (m *Map) IsEmpty() bool {
 	return len(m.replicas) == 0
 }
 
-// Adds some keys to the hash.
+// Add adds keys and immediately updates routing without balancing the ring.
+// Call Adjust after a batch of changes to balance the distribution.
 func (m *Map) Add(keys ...string) {
 	for _, key := range keys {
 		m.AddWithWeight(key, m.replica)
 	}
 }
 
-// Adds a key with different replica to the hash.
+// AddWithWeight immediately updates a key's weight without balancing the ring.
 func (m *Map) AddWithWeight(key string, replica int) {
 	if replica < 1 {
 		panic("replica should be positive")
 	}
 	old := m.replicas[key]
 	if old != replica {
-		m.keys = m.keys[:0]
 		m.replicas[key] = replica
-		m.adjust(5, 0.75)
+		m.updatePoints(key, replica)
+		m.dirty = true
 	}
 }
 
-// Remove a key from hash
+// Remove immediately removes a key from routing without balancing the ring.
 func (m *Map) Remove(key string) {
 	if _, ok := m.replicas[key]; ok {
+		m.updatePoints(key, 0)
 		delete(m.replicas, key)
 		delete(m.hashs, key)
-		m.keys = m.keys[:0]
-		m.adjust(5, 0.75)
+		m.dirty = true
 	}
+}
+
+func (m *Map) addPoint(hash int, key string) {
+	owner, exists := m.hashMap[hash]
+	if !exists {
+		m.hashMap[hash] = key
+		return
+	}
+	owners := m.owners[hash]
+	if owners == nil {
+		owners = map[string]int{owner: 1}
+		m.owners[hash] = owners
+	}
+	owners[key]++
+	if key < owner {
+		m.hashMap[hash] = key
+	}
+}
+
+func (m *Map) removePoint(hash int, key string) {
+	owners := m.owners[hash]
+	if owners == nil {
+		delete(m.hashMap, hash)
+		return
+	}
+	owners[key]--
+	if owners[key] == 0 {
+		delete(owners, key)
+	}
+	var owner string
+	var count int
+	for candidate, replicas := range owners {
+		if count == 0 || candidate < owner {
+			owner = candidate
+		}
+		count += replicas
+	}
+	if count <= 1 {
+		delete(m.owners, hash)
+	}
+	if count == 0 {
+		delete(m.hashMap, hash)
+	} else {
+		m.hashMap[hash] = owner
+	}
+}
+
+func (m *Map) updatePoints(key string, count int) {
+	hashes := m.hashs[key]
+	previous := len(hashes)
+	if count == previous {
+		return
+	}
+	for index := len(hashes); index < count; index++ {
+		hashes = append(hashes, int(m.hash([]byte(strconv.Itoa(index)+key))))
+	}
+	var added, removed []int
+	if count > previous {
+		added = append([]int(nil), hashes[previous:count]...)
+		for _, hash := range added {
+			m.addPoint(hash, key)
+		}
+	} else {
+		removed = append([]int(nil), hashes[count:previous]...)
+		for _, hash := range removed {
+			m.removePoint(hash, key)
+		}
+	}
+	m.hashs[key] = hashes[:count]
+	m.updateKeys(added, removed)
+}
+
+func (m *Map) updateKeys(added, removed []int) {
+	if len(removed) > 0 {
+		sort.Ints(removed)
+		kept, consumed := 0, 0
+		for _, hash := range m.keys {
+			if consumed < len(removed) && hash == removed[consumed] {
+				consumed++
+			} else {
+				m.keys[kept] = hash
+				kept++
+			}
+		}
+		m.keys = m.keys[:kept]
+	}
+	if len(added) > 0 {
+		sort.Ints(added)
+		remaining := len(m.keys) - 1
+		m.keys = append(m.keys, added...)
+		position := len(m.keys) - 1
+		for incoming := len(added) - 1; incoming >= 0; position-- {
+			if remaining >= 0 && m.keys[remaining] > added[incoming] {
+				m.keys[position] = m.keys[remaining]
+				remaining--
+			} else {
+				m.keys[position] = added[incoming]
+				incoming--
+			}
+		}
+	}
+}
+
+func (m *Map) updateRing(replicas map[string]int) {
+	var additions, removals int
+	for key, count := range replicas {
+		previous := len(m.hashs[key])
+		if count > previous {
+			additions += count - previous
+		} else {
+			removals += previous - count
+		}
+	}
+	added := make([]int, 0, additions)
+	removed := make([]int, 0, removals)
+	for key, count := range replicas {
+		hashes := m.hashs[key]
+		previous := len(hashes)
+		if count == previous {
+			continue
+		}
+		if count > previous {
+			for index := previous; index < count; index++ {
+				hash := int(m.hash([]byte(strconv.Itoa(index) + key)))
+				hashes = append(hashes, hash)
+				added = append(added, hash)
+				m.addPoint(hash, key)
+			}
+		} else {
+			removed = append(removed, hashes[count:previous]...)
+			for _, hash := range hashes[count:previous] {
+				m.removePoint(hash, key)
+			}
+		}
+		m.hashs[key] = hashes[:count]
+	}
+	m.updateKeys(added, removed)
+}
+
+// Adjust balances the ring after membership changes and reports whether it rebuilt
+// the ring. Callers must exclude concurrent updates and lookups, as with Add and Remove.
+func (m *Map) Adjust() bool {
+	dirty := m.dirty
+	m.adjust(5, 0.75)
+	return dirty
 }
 
 func (m *Map) calc(replicas map[string]int) {
-	var total int
-	for _, r := range replicas {
-		total += r
+	for hash := range m.hashMap {
+		delete(m.hashMap, hash)
+	}
+	for hash := range m.owners {
+		delete(m.owners, hash)
+	}
+	for key, hashes := range m.hashs {
+		if _, exists := replicas[key]; !exists {
+			m.hashs[key] = hashes[:0]
+		}
 	}
 	m.keys = m.keys[:0]
-	for key, r := range replicas {
-		hs := m.hashs[key]
-		for i := 0; i < r; i++ {
-			var hash int
-			if i < len(hs) {
-				hash = hs[i]
-			} else {
-				hash = int(m.hash([]byte(strconv.Itoa(i) + key)))
-				hs = append(hs, hash)
-			}
-			m.keys = append(m.keys, hash)
-			m.hashMap[hash] = key
+	for key, count := range replicas {
+		if count < 0 {
+			count = 0
 		}
-		m.hashs[key] = hs
+		hashes := m.hashs[key]
+		for index := len(hashes); index < count; index++ {
+			hashes = append(hashes, int(m.hash([]byte(strconv.Itoa(index)+key))))
+		}
+		hashes = hashes[:count]
+		m.hashs[key] = hashes
+		m.keys = append(m.keys, hashes...)
+		for _, hash := range hashes {
+			m.addPoint(hash, key)
+		}
 	}
 	sort.Ints(m.keys)
 }
 
 // adjust the replica for keys
 func (m *Map) adjust(tries int, scale float64) {
-	if len(m.keys) != 0 {
+	if !m.dirty {
 		return
 	}
+	m.dirty = false
 	m.calc(m.replicas)
 	if len(m.replicas) <= 1 || m.replica < 10 {
 		return
@@ -135,15 +292,18 @@ func (m *Map) adjust(tries int, scale float64) {
 			rep := reps[k]
 			expect := float64(m.replicas[k]) / float64(replicas)
 			adjust := int(float64(rep) * (expect - actual) / float64(expect) * scale)
-			if adjust > 1 || adjust < 1 {
+			if adjust > 1 || adjust < -1 {
 				reps[k] += adjust
+				if reps[k] < 1 {
+					reps[k] = 1
+				}
 				changed = true
 			}
 		}
 		if !changed {
 			return
 		}
-		m.calc(reps)
+		m.updateRing(reps)
 	}
 }
 
@@ -179,13 +339,27 @@ func (m *Map) Get2(key string) (string, string) {
 	idx2 := idx
 	second := ""
 	if len(m.replicas) > 1 {
-		for m.hashMap[m.keys[idx2]] == first {
+		for {
+			hash := m.keys[idx2]
+			if owner := m.hashMap[hash]; owner != first {
+				return first, owner
+			}
+			for owner := range m.owners[hash] {
+				if owner != first && (second == "" || owner < second) {
+					second = owner
+				}
+			}
+			if second != "" {
+				return first, second
+			}
 			idx2++
 			if idx2 == len(m.keys) {
 				idx2 = 0
 			}
+			if idx2 == idx {
+				break
+			}
 		}
-		second = m.hashMap[m.keys[idx2]]
 	}
 	return first, second
 }
