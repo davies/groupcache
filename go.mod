@@ -1,6 +1,6 @@
 module github.com/davies/groupcache
 
-go 1.19
+go 1.21
 
 require (
 	github.com/spaolacci/murmur3 v1.1.0

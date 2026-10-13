@@ -227,18 +227,17 @@ func (m *Map) updateRing(replicas map[string]int) {
 // Adjust balances the ring after membership changes and reports whether it rebuilt
 // the ring. Callers must exclude concurrent updates and lookups, as with Add and Remove.
 func (m *Map) Adjust() bool {
-	dirty := m.dirty
-	m.adjust(5, 0.75)
-	return dirty
+	if m.dirty {
+		m.adjust(5, 0.75)
+		m.dirty = false
+		return true
+	}
+	return false
 }
 
 func (m *Map) calc(replicas map[string]int) {
-	for hash := range m.hashMap {
-		delete(m.hashMap, hash)
-	}
-	for hash := range m.owners {
-		delete(m.owners, hash)
-	}
+	clear(m.hashMap)
+	clear(m.owners)
 	for key, hashes := range m.hashs {
 		if _, exists := replicas[key]; !exists {
 			m.hashs[key] = hashes[:0]
@@ -265,10 +264,6 @@ func (m *Map) calc(replicas map[string]int) {
 
 // adjust the replica for keys
 func (m *Map) adjust(tries int, scale float64) {
-	if !m.dirty {
-		return
-	}
-	m.dirty = false
 	m.calc(m.replicas)
 	if len(m.replicas) <= 1 || m.replica < 10 {
 		return
@@ -362,4 +357,36 @@ func (m *Map) Get2(key string) (string, string) {
 		}
 	}
 	return first, second
+}
+
+func (m *Map) Clone() *Map {
+	clone := &Map{
+		hash:     m.hash,
+		replica:  m.replica,
+		keys:     make([]int, len(m.keys)),
+		hashMap:  make(map[int]string, len(m.hashMap)),
+		hashs:    make(map[string][]int, len(m.hashs)),
+		replicas: make(map[string]int, len(m.replicas)),
+		owners:   make(map[int]map[string]int, len(m.owners)),
+		dirty:    m.dirty,
+	}
+	copy(clone.keys, m.keys)
+	for k, v := range m.hashMap {
+		clone.hashMap[k] = v
+	}
+	for k, v := range m.hashs {
+		clone.hashs[k] = make([]int, len(v))
+		copy(clone.hashs[k], v)
+	}
+	for k, v := range m.replicas {
+		clone.replicas[k] = v
+	}
+	for k, v := range m.owners {
+		v2 := make(map[string]int, len(v))
+		for owner, count := range v {
+			v2[owner] = count
+		}
+		clone.owners[k] = v2
+	}
+	return clone
 }
