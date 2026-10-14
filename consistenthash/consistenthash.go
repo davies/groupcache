@@ -287,7 +287,7 @@ func (m *Map) adjust(tries int, scale float64) {
 			rep := reps[k]
 			expect := float64(m.replicas[k]) / float64(replicas)
 			adjust := int(float64(rep) * (expect - actual) / float64(expect) * scale)
-			if adjust > 1 || adjust < -1 {
+			if adjust > 1 || adjust <= -1 {
 				reps[k] += adjust
 				if reps[k] < 1 {
 					reps[k] = 1
